@@ -1,4 +1,4 @@
-// server.js - updated backend for 365 app (per-user, per-day media upload handling)
+// server.js - production-ready backend for 365 app with proper Cloudinary per-user/day separation
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
@@ -55,16 +55,15 @@ const mediaSubSchema = new mongoose.Schema({
 }, { _id: false });
 
 const dayEntrySchema = new mongoose.Schema({
-  userId: { type: String, required: true }, // string to match frontend
-  month: { type: Number, required: true }, // 0-11
-  dayNumber: { type: Number, required: true }, // 1-31
+  userId: { type: String, required: true }, 
+  month: { type: Number, required: true },
+  dayNumber: { type: Number, required: true },
   text: { type: String, default: "" },
   mood: { type: String, default: "" },
-  media: [mediaSubSchema],
+  media: [ mediaSubSchema ],
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
-// ensure one entry per user/day/month
 dayEntrySchema.index({ userId: 1, month: 1, dayNumber: 1 }, { unique: true });
 const DayEntry = mongoose.models.DayEntry || mongoose.model("DayEntry", dayEntrySchema);
 
@@ -87,15 +86,19 @@ function authMiddleware(req, res, next) {
   }
 }
 
-function uploadToCloudinary(buffer, mimetype, filename = "file") {
+// --------- CLOUDINARY UPLOAD WITH PER-USER/DAY PATH ----------
+function uploadToCloudinary(buffer, mimetype, filename = "file", userId = "unknown", dayStr = "day") {
   return new Promise((resolve, reject) => {
     let resource_type = "auto";
     if (mimetype && mimetype.startsWith("image")) resource_type = "image";
     else if (mimetype && mimetype.startsWith("video")) resource_type = "video";
     else if (mimetype && mimetype.startsWith("audio")) resource_type = "raw";
 
+    // folder structure: 365_App/<userId>/<YYYY-MM-DD>
+    const folderPath = `365_App/${userId}/${dayStr}`;
+
     const uploadStream = cloudinary.uploader.upload_stream(
-      { resource_type, folder: "365_App", use_filename: true, unique_filename: false },
+      { resource_type, folder: folderPath, use_filename: true, unique_filename: true },
       (err, result) => {
         if (err) return reject(err);
         resolve(result);
@@ -110,7 +113,7 @@ function uploadToCloudinary(buffer, mimetype, filename = "file") {
 
 // ---------- Routes ----------
 
-// Health check
+// Basic health
 app.get("/", (req, res) => res.send("✅ 365 backend running"));
 
 // Signup
@@ -147,30 +150,33 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// POST /upload/:day - create or update per-user per-day entry
+// POST /upload/:day
 app.post("/upload/:day", authMiddleware, upload.array("files"), async (req, res) => {
   try {
     const dayParam = parseInt(req.params.day, 10);
     if (isNaN(dayParam) || dayParam < 1) return res.status(400).json({ error: "Invalid day param" });
 
-    const monthClient = req.body?.month !== undefined && req.body.month !== "" ? parseInt(req.body.month, 10) : null;
-    const month = typeof monthClient === "number" && !isNaN(monthClient) ? monthClient : (new Date()).getMonth();
-
-    const text = typeof req.body.text === "string" ? req.body.text : undefined;
-    const mood = typeof req.body.mood === "string" ? req.body.mood : undefined;
-
+    const monthClient = (req.body && req.body.month !== undefined && req.body.month !== "") ? parseInt(req.body.month, 10) : null;
+    const month = (typeof monthClient === "number" && !isNaN(monthClient)) ? monthClient : (new Date()).getMonth();
+    const text = (typeof req.body.text === "string") ? req.body.text : undefined;
+    const mood = (typeof req.body.mood === "string") ? req.body.mood : undefined;
     const userId = req.userId;
+
+    // Day string for folder: YYYY-MM-DD
+    const dayStr = new Date().toISOString().split("T")[0];
+
     let entry = await DayEntry.findOne({ userId, month, dayNumber: dayParam });
 
+    // upload files if present
     const uploadedMedia = [];
     if (req.files && req.files.length) {
       for (const f of req.files) {
         try {
-          const r = await uploadToCloudinary(f.buffer, f.mimetype, f.originalname);
+          const r = await uploadToCloudinary(f.buffer, f.mimetype, f.originalname, userId, dayStr);
           uploadedMedia.push({
             url: r.secure_url || r.url || "",
             public_id: r.public_id || "",
-            type: r.resource_type || (f.mimetype || "").split("/")[0] || "raw"
+            type: (r.resource_type || (f.mimetype || "").split("/")[0] || "raw")
           });
         } catch (err) {
           console.error("Cloudinary upload failed for file", f.originalname, err);
@@ -179,34 +185,21 @@ app.post("/upload/:day", authMiddleware, upload.array("files"), async (req, res)
     }
 
     if (!entry) {
-      // create new day entry
-      entry = new DayEntry({
-        userId,
-        month,
-        dayNumber: dayParam,
-        text: text ?? "",
-        mood: mood ?? "",
-        media: uploadedMedia
-      });
+      entry = new DayEntry({ userId, month, dayNumber: dayParam, text: text || "", mood: mood || "", media: uploadedMedia });
     } else {
-      // update text/mood if provided
       if (text !== undefined) entry.text = text;
       if (mood !== undefined) entry.mood = mood;
 
-      // replace existing media of same type
       if (uploadedMedia.length) {
         for (const nm of uploadedMedia) {
-          const sameType = entry.media.filter(m => m.type === nm.type);
+          const sameType = entry.media.filter(m => (m.type || "").toString() === (nm.type || "").toString());
           for (const old of sameType) {
             if (old.public_id) {
-              try {
-                await cloudinary.uploader.destroy(old.public_id, { resource_type: old.type || "auto", invalidate: true });
-              } catch (err) {
-                console.warn("Failed to destroy old media", old.public_id, err);
-              }
+              try { await cloudinary.uploader.destroy(old.public_id, { resource_type: old.type || "auto", invalidate: true }); } 
+              catch (destroyErr) { console.warn("Failed to destroy old media", old.public_id, destroyErr); }
             }
           }
-          entry.media = entry.media.filter(m => m.type !== nm.type);
+          entry.media = entry.media.filter(m => (m.type || "").toString() !== (nm.type || "").toString());
           entry.media.push(nm);
         }
       }
@@ -214,7 +207,6 @@ app.post("/upload/:day", authMiddleware, upload.array("files"), async (req, res)
 
     entry.updatedAt = new Date();
     await entry.save();
-
     const fresh = await DayEntry.findById(entry._id).lean();
     return res.json({ message: "Saved", dayEntry: fresh });
   } catch (err) {
@@ -223,14 +215,14 @@ app.post("/upload/:day", authMiddleware, upload.array("files"), async (req, res)
   }
 });
 
-// PATCH /upload/:day - update text/mood or remove media
+// PATCH /upload/:day
 app.patch("/upload/:day", authMiddleware, async (req, res) => {
   try {
     const dayParam = parseInt(req.params.day, 10);
     if (isNaN(dayParam) || dayParam < 1) return res.status(400).json({ error: "Invalid day param" });
 
     const { month, text, mood, removePublicIds, removeUrls } = req.body || {};
-    const m = typeof month === "number" && !isNaN(month) ? month : (new Date()).getMonth();
+    const m = (typeof month === "number" && !isNaN(month)) ? month : (new Date()).getMonth();
     const userId = req.userId;
 
     const query = { userId, month: m, dayNumber: dayParam };
@@ -245,11 +237,8 @@ app.patch("/upload/:day", authMiddleware, async (req, res) => {
 
     if (Array.isArray(removePublicIds) && removePublicIds.length) {
       for (const pid of removePublicIds) {
-        try {
-          await cloudinary.uploader.destroy(pid, { resource_type: "auto", invalidate: true });
-        } catch (err) {
-          console.warn("Cloud destroy failed for", pid, err);
-        }
+        try { await cloudinary.uploader.destroy(pid, { resource_type: "auto", invalidate: true }); } 
+        catch (err) { console.warn("Cloud destroy failed for", pid, err); }
       }
       await DayEntry.updateOne(query, { $pull: { media: { public_id: { $in: removePublicIds } } } });
     }
@@ -266,14 +255,14 @@ app.patch("/upload/:day", authMiddleware, async (req, res) => {
   }
 });
 
-// GET all days for user
+// GET /days
 app.get("/days", authMiddleware, async (req, res) => {
   try {
     const list = await DayEntry.find({ userId: req.userId }).sort({ month: 1, dayNumber: 1 }).lean();
     const normalized = list.map(doc => {
       const media = (doc.media || []).map(m => ({
-        url: m.url || "",
-        type: m.type || "",
+        url: m.url || m.secure_url || "",
+        type: (m.type || "").toString(),
         public_id: m.public_id || ""
       }));
       return { ...doc, media };
@@ -285,7 +274,7 @@ app.get("/days", authMiddleware, async (req, res) => {
   }
 });
 
-// GET single day by month/day
+// GET /day/:month/:day
 app.get("/day/:month/:day", authMiddleware, async (req, res) => {
   try {
     const month = parseInt(req.params.month, 10);
@@ -299,6 +288,6 @@ app.get("/day/:month/:day", authMiddleware, async (req, res) => {
   }
 });
 
-// Start server
+// start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Backend listening on ${PORT}`));
