@@ -291,3 +291,10 @@ app.get("/day/:month/:day", authMiddleware, async (req, res) => {
 // start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Backend listening on ${PORT}`));
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js")
+      .then((reg) => console.log("✅ Service Worker registered:", reg))
+      .catch((err) => console.log("❌ Service Worker registration failed:", err));
+  });
+}
